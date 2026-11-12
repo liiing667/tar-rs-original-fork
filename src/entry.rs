@@ -36,6 +36,7 @@ pub struct EntryFields<'a> {
     pub header_pos: u64,
     pub file_pos: u64,
     pub data: Vec<EntryIo<'a>>,
+    pub sparse_ranges: u64,
     pub unpack_xattrs: bool,
     pub preserve_permissions: bool,
     pub preserve_mtime: bool,

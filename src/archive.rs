@@ -7,6 +7,7 @@ use std::io::{self, SeekFrom};
 use std::marker;
 use std::path::Path;
 
+use crate::budget::{budget_error, BudgetErrorKind, UnpackBudget};
 use crate::entry::{EntryFields, EntryIo};
 use crate::error::TarError;
 use crate::other;
@@ -27,6 +28,7 @@ pub struct ArchiveInner<R: ?Sized> {
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
+    unpack_budget: UnpackBudget,
     obj: RefCell<R>,
 }
 
@@ -45,6 +47,8 @@ struct EntriesFields<'a> {
     next: u64,
     done: bool,
     raw: bool,
+    entries_seen: u64,
+    total_bytes: u64,
 }
 
 impl<R: Read> Archive<R> {
@@ -57,6 +61,7 @@ impl<R: Read> Archive<R> {
                 preserve_mtime: true,
                 overwrite: true,
                 ignore_zeros: false,
+                unpack_budget: UnpackBudget::default(),
                 obj: RefCell::new(obj),
                 pos: Cell::new(0),
             },
@@ -146,6 +151,27 @@ impl<R: Read> Archive<R> {
     pub fn set_ignore_zeros(&mut self, ignore_zeros: bool) {
         self.inner.ignore_zeros = ignore_zeros;
     }
+
+    /// Configures the [`UnpackBudget`] used while reading this archive.
+    ///
+    /// Every archive starts with the conservative [`UnpackBudget::default`],
+    /// which limits the number of entries, the cumulative expanded size, the
+    /// size of individual entries and the number of sparse ranges. Passing
+    /// [`UnpackBudget::unlimited`] disables these checks.
+    ///
+    /// The budget is enforced while iterating over entries (and therefore also
+    /// by [`Archive::unpack`]), before any entry data is read or written, so
+    /// that malformed or malicious archives cannot exhaust disk space or
+    /// inodes.
+    pub fn set_unpack_budget(&mut self, budget: UnpackBudget) -> &mut Archive<R> {
+        self.inner.unpack_budget = budget;
+        self
+    }
+
+    /// Returns the [`UnpackBudget`] currently in effect for this archive.
+    pub fn unpack_budget(&self) -> &UnpackBudget {
+        &self.inner.unpack_budget
+    }
 }
 
 impl<R: Seek + Read> Archive<R> {
@@ -183,6 +209,8 @@ impl Archive<dyn Read + '_> {
             done: false,
             next: 0,
             raw: false,
+            entries_seen: 0,
+            total_bytes: 0,
         })
     }
 
@@ -304,6 +332,7 @@ impl<'a> EntriesFields<'a> {
             long_pathname: None,
             long_linkname: None,
             pax_extensions: None,
+            sparse_ranges: 0,
             unpack_xattrs: self.archive.inner.unpack_xattrs,
             preserve_permissions: self.archive.inner.preserve_permissions,
             preserve_mtime: self.archive.inner.preserve_mtime,
@@ -325,7 +354,14 @@ impl<'a> EntriesFields<'a> {
 
     fn next_entry(&mut self) -> io::Result<Option<Entry<'a, io::Empty>>> {
         if self.raw {
-            return self.next_entry_raw(None);
+            return match self.next_entry_raw(None)? {
+                Some(entry) => {
+                    let fields = EntryFields::from(entry);
+                    self.enforce_budget(&fields)?;
+                    Ok(Some(fields.into_entry()))
+                }
+                None => Ok(None),
+            };
         }
 
         let mut gnu_longname = None;
@@ -390,8 +426,48 @@ impl<'a> EntriesFields<'a> {
             fields.long_linkname = gnu_longlink;
             fields.pax_extensions = pax_extensions;
             self.parse_sparse_header(&mut fields)?;
+            self.enforce_budget(&fields)?;
             return Ok(Some(fields.into_entry()));
         }
+    }
+
+    /// Verifies that adding `entry` does not violate the archive's
+    /// [`UnpackBudget`], updating the running counters on success.
+    ///
+    /// Checks run before any entry data is consumed so that iteration and
+    /// unpacking are both protected.
+    fn enforce_budget(&mut self, entry: &EntryFields<'a>) -> io::Result<()> {
+        let budget = &self.archive.inner.unpack_budget;
+
+        let entries_seen = self
+            .entries_seen
+            .checked_add(1)
+            .ok_or_else(|| budget_error(BudgetErrorKind::EntryLimitExceeded))?;
+        if entries_seen > budget.max_entries() {
+            return Err(budget_error(BudgetErrorKind::EntryLimitExceeded));
+        }
+
+        if entry.header.entry_type().is_gnu_sparse()
+            && entry.sparse_ranges > budget.max_sparse_ranges()
+        {
+            return Err(budget_error(BudgetErrorKind::SparseRangesLimitExceeded));
+        }
+
+        if entry.size > budget.max_file_bytes() {
+            return Err(budget_error(BudgetErrorKind::FileSizeLimitExceeded));
+        }
+
+        let total_bytes = self
+            .total_bytes
+            .checked_add(entry.size)
+            .ok_or_else(|| budget_error(BudgetErrorKind::TotalBytesLimitExceeded))?;
+        if total_bytes > budget.max_total_bytes() {
+            return Err(budget_error(BudgetErrorKind::TotalBytesLimitExceeded));
+        }
+
+        self.entries_seen = entries_seen;
+        self.total_bytes = total_bytes;
+        Ok(())
     }
 
     fn parse_sparse_header(&mut self, entry: &mut EntryFields<'a>) -> io::Result<()> {
@@ -426,6 +502,8 @@ impl<'a> EntriesFields<'a> {
 
         let mut cur = 0;
         let mut remaining = entry.size;
+        let mut sparse_ranges = entry.sparse_ranges;
+        let max_sparse_ranges = self.archive.inner.unpack_budget.max_sparse_ranges();
         {
             let data = &mut entry.data;
             let reader = &self.archive.inner;
@@ -433,6 +511,12 @@ impl<'a> EntriesFields<'a> {
             let mut add_block = |block: &GnuSparseHeader| -> io::Result<_> {
                 if block.is_empty() {
                     return Ok(());
+                }
+                sparse_ranges = sparse_ranges
+                    .checked_add(1)
+                    .ok_or_else(|| budget_error(BudgetErrorKind::SparseRangesLimitExceeded))?;
+                if sparse_ranges > max_sparse_ranges {
+                    return Err(budget_error(BudgetErrorKind::SparseRangesLimitExceeded));
                 }
                 let off = block.offset()?;
                 let len = block.length()?;
@@ -480,6 +564,7 @@ impl<'a> EntriesFields<'a> {
                 }
             }
         }
+        entry.sparse_ranges = sparse_ranges;
         if cur != gnu.real_size()? {
             return Err(other(
                 "mismatch in sparse file chunks and \
